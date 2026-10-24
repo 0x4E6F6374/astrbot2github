@@ -1,77 +1,114 @@
-import { serve } from "https://deno.land/std@0.155.0/http/server.ts"; // 或更新到最新稳定版，如 @0.224.0
+export default {
+  async fetch(req: Request): Promise<Response> {
+    const incomingUrl = new URL(req.url);
 
-async function handler(req: Request): Promise<Response> {
-  const incomingUrl = new URL(req.url);
-  if (incomingUrl.pathname === "/") {
-    return new Response(
-      "此地址只用于为astrbot提供更快速的github访问服务",
-      {
-        status: 200, // OK
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-      }
-    );
-  }
-  // 1. 从请求路径中提取目标 URL
-  //    - incomingUrl.pathname 会是像 "/https://github.com/..." 这样的形式
-  //    - slice(1) 去掉开头的 "/"
-  //    - decodeURIComponent 处理路径中可能存在的 URL 编码 (例如 %2F)
-  const targetUrlString = decodeURIComponent(incomingUrl.pathname.slice(1));
-
-  // 2. 验证提取出的字符串是否看起来像一个有效的 URL
-  if (!targetUrlString || (!targetUrlString.startsWith("http://") && !targetUrlString.startsWith("https://"))) {
-    // 如果路径为空或者不是以 http/https 开头，则返回错误
-    return new Response("Invalid or missing target URL in path. Usage: /<target_url>", {
-      status: 400, // Bad Request
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
-  }
-
-  console.log(`Proxying request to: ${targetUrlString}`); // 打印日志，方便调试
-
-  try {
-    // 3. 使用提取出的目标 URL 发起 fetch 请求
-    //    并将原始请求的方法、头信息、请求体都转发过去
-    const response = await fetch(targetUrlString, {
-      headers: req.headers, // 转发原始请求头
-      method: req.method,   // 转发原始请求方法
-      body: req.body,     // 转发原始请求体 (支持流式传输)
-      redirect: 'manual', // 重要：不自动处理重定向，将 3xx 响应返回给客户端处理
-                           // 或者设为 'follow' 让代理服务器处理重定向
-    });
-
-    // 4. 返回从目标服务器获取的响应
-    //    为了允许跨域请求 (例如浏览器 JS 调用此代理)，添加 CORS 头
-    const responseHeaders = new Headers(response.headers); // 复制响应头以便修改
-    responseHeaders.set("Access-Control-Allow-Origin", "*"); // 允许任何来源访问
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"); // 允许的方法
-    responseHeaders.set("Access-Control-Allow-Headers", "Content-Type, Authorization, *"); // 允许的请求头
-    // 可以根据需要更精细地控制 CORS 头
-
-    // 处理浏览器的 OPTIONS 预检请求
-     if (req.method === "OPTIONS") {
-        return new Response(null, {
-            status: 204, // No Content
-            headers: responseHeaders
-        });
+    // 根路径提示
+    if (incomingUrl.pathname === "/") {
+      return new Response(
+        "此地址只用于为astrbot提供更快速的github访问服务",
+        {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        }
+      );
     }
 
-    // 直接返回目标服务器的响应体、状态码和处理过的头信息
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
+    // 统一的 CORS 头
+    const corsHeaders = new Headers({
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, *",
     });
 
-  } catch (error) {
-    // 5. 处理 fetch 过程中可能发生的错误 (例如网络问题、目标服务器无法访问)
-    console.error(`Error fetching ${targetUrlString}:`, error);
-    return new Response(`Failed to proxy request to ${targetUrlString}: ${error.message}`, {
-      status: 502, // Bad Gateway
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
-  }
-}
+    // 1. 提取目标 URL（去掉开头的 "/"，并解码）
+    const targetUrlString = decodeURIComponent(incomingUrl.pathname.slice(1));
 
-console.log("此地址只用于帮助astrbot更快的连接github"); // Deno Deploy 会自动使用 $PORT
-// 监听端口 8000 (本地) 或 Deno Deploy 指定的端口
-serve(handler);
+    // 2. 校验
+    if (
+      !targetUrlString ||
+      (!targetUrlString.startsWith("http://") &&
+        !targetUrlString.startsWith("https://"))
+    ) {
+      return new Response(
+        "Invalid or missing target URL in path. Usage: /<target_url>",
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            ...Object.fromEntries(corsHeaders),
+          },
+        }
+      );
+    }
+
+    // 3. 预检请求直接返回，避免打到目标服务器
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    console.log(`Proxying request to: ${targetUrlString}`);
+
+    try {
+      // 4. 复制并过滤请求头
+      //    Workers 不允许直接转发部分由平台管理的头（如 host、cf-* 等），
+      //    转发它们可能导致请求失败或被边缘节点丢弃。
+      const forwardHeaders = new Headers(req.headers);
+      const blockedHeaders = [
+        "host",
+        "cf-connecting-ip",
+        "cf-ipcountry",
+        "cf-ray",
+        "cf-visitor",
+        "cf-worker",
+        "x-forwarded-proto",
+        "x-forwarded-for",
+      ];
+      for (const h of blockedHeaders) {
+        forwardHeaders.delete(h);
+      }
+
+      // 5. 发起代理请求
+      const response = await fetch(targetUrlString, {
+        headers: forwardHeaders,
+        method: req.method,
+        body:
+          req.method === "GET" || req.method === "HEAD"
+            ? undefined
+            : req.body,
+        redirect: "manual", // 保留 3xx 交给客户端处理
+      });
+
+      // 6. 复制响应头并加上 CORS
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, OPTIONS"
+      );
+      responseHeaders.set(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, *"
+      );
+
+      // 7. 返回响应
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    } catch (error) {
+      console.error(`Error fetching ${targetUrlString}:`, error);
+      const msg = error instanceof Error ? error.message : String(error);
+      return new Response(
+        `Failed to proxy request to ${targetUrlString}: ${msg}`,
+        {
+          status: 502,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            ...Object.fromEntries(corsHeaders),
+          },
+        }
+      );
+    }
+  },
+};
